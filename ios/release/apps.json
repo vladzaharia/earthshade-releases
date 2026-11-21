@@ -1,0 +1,41 @@
+{
+  "_": "The Apple apps release-apple.yml ships to TestFlight and, as an unsigned IPA, to the AltStore and SideStore sources, keyed by the tag prefix (desk-v1.2.3, phone-v1.2.3). bundleId is what the bundle check and the source use; icon is copied into the feeds site. docs/ship/release.md, docs/ship/feeds.md.",
+  "desk": {
+    "project": "ios/App/EarthshadeDesk.xcodeproj",
+    "scheme": "EarthshadeDesk",
+    "appName": "EarthshadeDesk",
+    "bundleId": "gg.vlad.earthshade.desk",
+    "bundleCheck": "tools/ship/ipad.sh",
+    "displayName": "Earthshade Desk",
+    "subtitle": "The household calendar on an iPad",
+    "description": "Earthshade on the iPad: the household calendar, the day sheet and the voice assistant, paired with your own Earthshade service.",
+    "icon": "ios/App/EarthshadeDesk/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+    "minOSVersion": "26.0",
+    "permissions": {
+      "entitlements": [],
+      "privacy": {
+        "NSCameraUsageDescription": "The front camera notices who is at the desk and greets them; nothing it sees there is saved or sent. It also takes a person's photo for their circle, only when you choose Take a photo, and that photo is sent to your household's service.",
+        "NSMicrophoneUsageDescription": "The microphone listens for your voice only while someone is at the desk. Nothing is recorded.",
+        "NSSpeechRecognitionUsageDescription": "Your words are turned into text on this iPad so the calendar can answer. Audio never leaves it."
+      }
+    }
+  },
+  "phone": {
+    "project": "ios/App/EarthshadePhone.xcodeproj",
+    "scheme": "EarthshadePhone",
+    "appName": "EarthshadePhone",
+    "bundleId": "gg.vlad.earthshade.phone",
+    "displayName": "Earthshade",
+    "subtitle": "The household calendar on an iPhone",
+    "description": "Earthshade on the iPhone: your household calendar, paired with your own Earthshade service.",
+    "icon": "ios/App/EarthshadePhone/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+    "minOSVersion": "26.0",
+    "permissions": {
+      "entitlements": [],
+      "privacy": {
+        "NSCameraUsageDescription": "To scan the square on your wall.",
+        "NSFaceIDUsageDescription": "To open your private entries."
+      }
+    }
+  }
+}

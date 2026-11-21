@@ -1,0 +1,149 @@
+# The publisher. It lives in the PUBLIC releases repository (docs/ship/release.md puts it there: tools/release/publisher/assemble.sh) and is
+# the last gate before public binaries. The private source repository's release workflows push one commit over SSH (a deploy key that can
+# write to this repository only) to a branch incoming/<tag>: the files in incoming/ and incoming.json. This workflow then, with its own
+# GITHUB_TOKEN and no other secret:
+#   1. verifies incoming.json and the sha256 of every file, and (a wall APK) the signing certificate against tools/release/release-cert.sha256
+#   2. refuses a versionCode that is not above the channel's current one, and writes update.json
+#   3. creates or updates the GitHub Release (and the rolling `beta` release), rebuilds the feeds and deploys them to Pages
+#   4. deletes the incoming branch, so the binaries do not stay in git history.
+# A failure leaves the branch and an error; nothing is published before every check has passed, and a rerun (Actions, Re-run jobs) is safe.
+# workflow_dispatch rebuilds the feeds only (after a release was deleted by hand).
+# The F-Droid repositories are signed in the private repository (the key is there); this workflow only places them. The last ones placed are
+# kept as the asset fdroid.tar of the release `feeds-state`, so a later Apple release does not drop them.
+name: publish
+
+on:
+  push:
+    branches: ['incoming/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One publish at a time. The run started by the cleanup's own branch deletion gets a group of its own, so it never takes the pending slot of the
+# next hand-over. GitHub keeps only ONE pending run per group: with three hand-overs at once the middle one is cancelled, and is published by
+# Re-run on that cancelled run (docs/ship/release.md).
+concurrency:
+  group: publish-${{ github.event.deleted && github.run_id || 'q' }}
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.deleted == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The scripts and the pinned certificate come from main; only incoming/ comes from the pushed commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/checkout@v4
+        if: github.event_name == 'push'
+        with:
+          path: hand
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Take incoming/ from the hand-over, and nothing else
+        if: github.event_name == 'push'
+        run: |
+          other="$(git -C hand diff --name-only "origin/${{ github.event.repository.default_branch }}...HEAD" | grep -v '^incoming/' || true)"
+          if [ -n "$other" ]; then echo "::error::the hand-over changes files outside incoming/:"; echo "$other"; exit 1; fi
+          mv hand/incoming incoming
+
+      - name: Verify the hand-over
+        if: github.event_name == 'push'
+        run: node tools/release/incoming.mjs verify incoming
+
+      - name: Plan (the versionCode guard) and check nothing is published yet
+        if: github.event_name == 'push'
+        run: |
+          # Only a 404 means nothing is published yet; any other failure stops the job, so the guard never fails open.
+          fetch() {
+            code=$(curl -sSL -o "$2" -w '%{http_code}' "$1") || { echo "::error::could not reach $1"; exit 1; }
+            case "$code" in 200) ;; 404) rm -f "$2" ;; *) echo "::error::unexpected HTTP $code from $1"; exit 1 ;; esac
+          }
+          tag="$(node -p 'JSON.parse(require("fs").readFileSync("incoming/incoming.json")).tag')"
+          fetch "https://github.com/$REPO/releases/download/beta/update.json" "$RUNNER_TEMP/beta.json"
+          case "$tag" in
+            *-beta.*) cp "$RUNNER_TEMP/beta.json" "$RUNNER_TEMP/current.json" 2>/dev/null || true ;;
+            *) fetch "https://github.com/$REPO/releases/latest/download/update.json" "$RUNNER_TEMP/current.json" ;;
+          esac
+          node tools/release/publisher/scripts/plan.mjs --incoming incoming --repo "$REPO" --out "$RUNNER_TEMP/plan" \
+            --current "$RUNNER_TEMP/current.json" --beta "$RUNNER_TEMP/beta.json"
+
+      - name: Stage the release (a draft with all its assets; nothing public yet)
+        if: github.event_name == 'push'
+        run: tools/release/publisher/scripts/release.sh stage incoming "$RUNNER_TEMP/plan" "$REPO"
+
+      - name: F-Droid repositories (handed over, or the ones placed last time)
+        run: |
+          if [ -f incoming/fdroid.tar ]; then
+            cp incoming/fdroid.tar "$RUNNER_TEMP/fdroid.tar"
+            if gh release view feeds-state --repo "$REPO" >/dev/null 2>&1; then gh release upload feeds-state "$RUNNER_TEMP/fdroid.tar" --repo "$REPO" --clobber
+            else gh release create feeds-state "$RUNNER_TEMP/fdroid.tar" --repo "$REPO" --prerelease --title "Feeds state" --notes "The F-Droid repositories as last signed; the publisher keeps them here. Not a release."; fi
+          else
+            gh release download feeds-state --repo "$REPO" --pattern fdroid.tar --dir "$RUNNER_TEMP" 2>/dev/null || echo "no F-Droid repositories yet"
+          fi
+
+      - name: Build the feeds site
+        run: |
+          gh api "repos/$REPO/releases?per_page=100" --paginate --jq '.[]' > "$RUNNER_TEMP/releases.ndjson"
+          # the staged release is still a draft; the feeds are built as if it were published (it is, once the deploy has succeeded)
+          if [ "${{ github.event_name }}" = push ]; then
+            tag="$(node -p 'JSON.parse(require("fs").readFileSync("incoming/incoming.json")).tag')"
+            jq -c --arg t "$tag" 'if .tag_name == $t then .draft = false else . end' "$RUNNER_TEMP/releases.ndjson" > "$RUNNER_TEMP/r2.ndjson"
+            mv "$RUNNER_TEMP/r2.ndjson" "$RUNNER_TEMP/releases.ndjson"
+          fi
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          tarflag=(); [ -f "$RUNNER_TEMP/fdroid.tar" ] && tarflag=(--fdroid-tar "$RUNNER_TEMP/fdroid.tar")
+          node tools/release/publisher/scripts/site.mjs --releases "$RUNNER_TEMP/releases.ndjson" --out "$RUNNER_TEMP/site" \
+            --repo "$REPO" --site-url "https://$owner.github.io/${GITHUB_REPOSITORY#*/}" "${tarflag[@]}"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Last: the release goes public and the beta channel moves only after the feeds are deployed.
+  finalize:
+    needs: [publish, deploy]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}/plan
+      - name: Publish the release and move the beta channel
+        run: tools/release/publisher/scripts/release.sh finish incoming "$RUNNER_TEMP/plan" "$REPO"
+      - name: Delete the incoming branch
+        run: gh api --method DELETE "repos/$REPO/git/refs/heads/${GITHUB_REF_NAME}"
