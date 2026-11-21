@@ -8,8 +8,10 @@
 #   4. deletes the incoming branch, so the binaries do not stay in git history.
 # A failure leaves the branch and an error; nothing is published before every check has passed, and a rerun (Actions, Re-run jobs) is safe.
 # workflow_dispatch rebuilds the feeds only (after a release was deleted by hand).
-# The F-Droid repositories are signed in the private repository (the key is there); this workflow only places them. The last ones placed are
-# kept as the asset fdroid.tar of the release `feeds-state`, so a later Apple release does not drop them.
+# The F-Droid indexes are signed in the private repository (the key is there). The hand-over carries the indexes and the one new APK only (nothing
+# in it grows with the number of releases); this workflow supplies the earlier APKs from the release assets it already holds, refuses an index it
+# cannot back with an APK of the same sha256, and keeps the last index (a few KB) as the asset fdroid-index.tar of the release `feeds-state`, so a
+# later Apple release does not drop the F-Droid repositories and the private side knows the metadata of earlier builds.
 name: publish
 
 on:
@@ -82,14 +84,19 @@ jobs:
         if: github.event_name == 'push'
         run: tools/release/publisher/scripts/release.sh stage incoming "$RUNNER_TEMP/plan" "$REPO"
 
-      - name: F-Droid repositories (handed over, or the ones placed last time)
+      - name: F-Droid index (handed over, or the one kept last time)
         run: |
-          if [ -f incoming/fdroid.tar ]; then
-            cp incoming/fdroid.tar "$RUNNER_TEMP/fdroid.tar"
-            if gh release view feeds-state --repo "$REPO" >/dev/null 2>&1; then gh release upload feeds-state "$RUNNER_TEMP/fdroid.tar" --repo "$REPO" --clobber
-            else gh release create feeds-state "$RUNNER_TEMP/fdroid.tar" --repo "$REPO" --prerelease --title "Feeds state" --notes "The F-Droid repositories as last signed; the publisher keeps them here. Not a release."; fi
+          if [ -f incoming/fdroid-index.tar ]; then
+            cp incoming/fdroid-index.tar "$RUNNER_TEMP/fdroid-tar"
           else
-            gh release download feeds-state --repo "$REPO" --pattern fdroid.tar --dir "$RUNNER_TEMP" 2>/dev/null || echo "no F-Droid repositories yet"
+            # the kept index (a few KB); the legacy fdroid.tar (every APK inside) is still understood until the first release replaces it
+            # only a missing feeds-state release or asset means "no F-Droid repositories yet"; any other failure stops the job
+            names="$(gh release view feeds-state --repo "$REPO" --json assets --jq '.assets[].name' 2>"$RUNNER_TEMP/gh.err")" || {
+              if grep -qi 'not found' "$RUNNER_TEMP/gh.err"; then names=""; echo "no F-Droid repositories yet"; else cat "$RUNNER_TEMP/gh.err" >&2; exit 1; fi; }
+            for asset in fdroid-index.tar fdroid.tar; do
+              if printf '%s\n' "$names" | grep -qx "$asset"; then gh release download feeds-state --repo "$REPO" --pattern "$asset" --dir "$RUNNER_TEMP/kept"; break; fi
+            done
+            f="$(ls "$RUNNER_TEMP"/kept/* 2>/dev/null | head -1 || true)"; [ -z "$f" ] || cp "$f" "$RUNNER_TEMP/fdroid-tar"
           fi
 
       - name: Build the feeds site
@@ -102,9 +109,16 @@ jobs:
             mv "$RUNNER_TEMP/r2.ndjson" "$RUNNER_TEMP/releases.ndjson"
           fi
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          tarflag=(); [ -f "$RUNNER_TEMP/fdroid.tar" ] && tarflag=(--fdroid-tar "$RUNNER_TEMP/fdroid.tar")
+          # The index names APKs; the publisher supplies them: the new one from incoming/, the earlier ones from the release assets. An index it cannot
+          # back with an APK of the same sha256 fails the job here, before anything is deployed or kept.
+          tarflag=(); [ -f "$RUNNER_TEMP/fdroid-tar" ] && tarflag=(--fdroid-tar "$RUNNER_TEMP/fdroid-tar" --apk-dir incoming --assets "$RUNNER_TEMP/apks")
           node tools/release/publisher/scripts/site.mjs --releases "$RUNNER_TEMP/releases.ndjson" --out "$RUNNER_TEMP/site" \
             --repo "$REPO" --site-url "https://$owner.github.io/${GITHUB_REPOSITORY#*/}" "${tarflag[@]}"
+
+      - name: Carry the F-Droid index to the finalize job
+        if: github.event_name == 'push'
+        run: '[ ! -f incoming/fdroid-index.tar ] || cp incoming/fdroid-index.tar "$RUNNER_TEMP/plan/fdroid-index.tar"'
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/site
@@ -145,5 +159,14 @@ jobs:
           path: ${{ runner.temp }}/plan
       - name: Publish the release and move the beta channel
         run: tools/release/publisher/scripts/release.sh finish incoming "$RUNNER_TEMP/plan" "$REPO"
+      - name: Keep the F-Droid index for the next release
+        if: github.event_name == 'push'
+        run: |
+          # after the deploy and the release going public (a failed deploy or an abandoned draft must not leave a state naming an APK no release holds): the asset is the small index tar (indexes and the metadata of the kept builds), never an APK
+          if [ -f "$RUNNER_TEMP/plan/fdroid-index.tar" ]; then
+            if gh release view feeds-state --repo "$REPO" >/dev/null 2>&1; then gh release upload feeds-state "$RUNNER_TEMP/plan/fdroid-index.tar" --repo "$REPO" --clobber
+            else gh release create feeds-state "$RUNNER_TEMP/plan/fdroid-index.tar" --repo "$REPO" --prerelease --title "Feeds state" --notes "The F-Droid indexes as last signed, with the metadata of the kept builds; the publisher keeps them here. Not a release."; fi
+            gh release delete-asset feeds-state fdroid.tar --repo "$REPO" --yes 2>/dev/null || true   # the legacy archive that held every APK
+          fi
       - name: Delete the incoming branch
         run: gh api --method DELETE "repos/$REPO/git/refs/heads/${GITHUB_REF_NAME}"

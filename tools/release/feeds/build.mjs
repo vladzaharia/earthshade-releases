@@ -10,6 +10,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseReleases, classify } from './lib.mjs';
 import { buildSource, validateSource } from './altstore.mjs';
+import { indexPage } from './index-page.mjs';
 import { selectApks, prepareRepo, signIndex, validateRepoDir } from './fdroid.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -22,6 +23,7 @@ export function buildSite({ releasesFile, assetsDir, out, repo, siteUrl, fdroidM
   mkdirSync(join(out, 'icons'), { recursive: true });
   writeFileSync(join(out, '.nojekyll'), '');
   copyFileSync(join(here, 'README-releases.md'), join(out, 'README.md'));
+  writeFileSync(join(out, 'index.html'), indexPage({ repo, siteUrl }));
   for (const [k, v] of Object.entries(apps)) if (v.icon) copyFileSync(join(root, v.icon), join(out, 'icons', `${k}.png`));
 
   for (const channel of ['stable', 'beta']) {

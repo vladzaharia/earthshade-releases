@@ -97,7 +97,12 @@ export function validateRepoDir(repoDir, { jarsigner = false } = {}) {
       if (createHash('sha256').update(readFileSync(f)).digest('hex') !== p.hash) throw new Error(`index-v1: ${p.apkName} does not match its hash`);
     }
     if (!existsSync(join(repoDir, 'index-v1.jar'))) throw new Error('index-v1.jar (the signed index) is missing');
-    if (jarsigner) execFileSync('jarsigner', ['-verify', join(repoDir, 'index-v1.jar')], { stdio: 'pipe' });
+    // the jar is what clients read: it must hold exactly this index-v1.json, and (when asked) carry a valid signature
+    if (jarsigner) {
+      execFileSync('jarsigner', ['-verify', join(repoDir, 'index-v1.jar')], { stdio: 'pipe' });
+      const inJar = execFileSync('unzip', ['-p', join(repoDir, 'index-v1.jar'), 'index-v1.json'], { maxBuffer: 64 << 20 });
+      if (!inJar.equals(readFileSync(v1))) throw new Error('index-v1.jar does not hold this index-v1.json');
+    }
     return;
   }
   for (const f of ['entry.jar', 'index-v2.json']) if (!existsSync(join(repoDir, f))) throw new Error(`neither index-v1.json nor ${f} in ${repoDir}`);
@@ -105,17 +110,24 @@ export function validateRepoDir(repoDir, { jarsigner = false } = {}) {
   if (!v2.repo?.timestamp || !v2.packages?.[PACKAGE]?.versions) throw new Error('index-v2.json: repo or packages missing');
 }
 
-// Local dry run: write index-v1.json from the APKs in <dir>/repo and sign it into index-v1.jar with jarsigner (the password stays in the environment).
+// Writes index-v1.json for apks (each with sha256, sig, signer, size: nothing is read from an APK file) into <repoDir> and signs it into
+// index-v1.jar with jarsigner (the password stays in the environment). The private release workflow uses this with the metadata of earlier builds
+// kept in the hand-over state, so it never needs the earlier APKs; the publisher holds those.
+export function writeSignedIndex({ repoDir, apks, repoUrl, name, keystore, alias, passEnv = 'FDROID_KEYSTORE_PASS', now = Date.now() }) {
+  mkdirSync(repoDir, { recursive: true });
+  writeFileSync(join(repoDir, 'index-v1.json'), JSON.stringify(indexV1({ apks, repoUrl, name, now })));
+  rmSync(join(repoDir, 'index-v1.jar'), { force: true });
+  execFileSync('zip', ['-q', '-j', 'index-v1.jar', 'index-v1.json'], { cwd: repoDir });
+  execFileSync('jarsigner', ['-keystore', keystore, `-storepass:env`, passEnv, '-sigalg', 'SHA256withRSA', '-digestalg', 'SHA256', 'index-v1.jar', alias], { cwd: repoDir, stdio: 'pipe' });
+}
+
+// Local dry run: the same from the APKs in <dir>/repo.
 export function signIndex({ dir, apks, repoUrl, name, keystore, alias, passEnv = 'FDROID_KEYSTORE_PASS' }) {
   const withCert = apks.map((a) => {
     const f = join(dir, 'repo', a.name), buf = readFileSync(f);
     return { ...a, ...certOfApk(f), sha256: createHash('sha256').update(buf).digest('hex'), size: buf.length };
   });
-  const repo = join(dir, 'repo');
-  writeFileSync(join(repo, 'index-v1.json'), JSON.stringify(indexV1({ apks: withCert, repoUrl, name })));
-  rmSync(join(repo, 'index-v1.jar'), { force: true });
-  execFileSync('zip', ['-q', '-j', 'index-v1.jar', 'index-v1.json'], { cwd: repo });
-  execFileSync('jarsigner', ['-keystore', keystore, `-storepass:env`, passEnv, '-sigalg', 'SHA256withRSA', '-digestalg', 'SHA256', 'index-v1.jar', alias], { cwd: repo, stdio: 'pipe' });
+  writeSignedIndex({ repoDir: join(dir, 'repo'), apks: withCert, repoUrl, name, keystore, alias, passEnv });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url) && process.argv[2] === 'validate') {

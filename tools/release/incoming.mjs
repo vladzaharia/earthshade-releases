@@ -14,15 +14,19 @@ import { fromTag } from './version.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// GitHub refuses a file over 100 MB in a push; the hand-over is a push, so anything near it fails here, early, with a message that says why.
+export const MAX_FILE = 95_000_000;
+const tooBig = (name, size) => { if (size > MAX_FILE) throw new Error(`${name}: ${(size / 1e6).toFixed(1)} MB is over the ${MAX_FILE / 1e6} MB limit for a hand-over file (GitHub refuses a file over 100 MB in a push)`); };
 const sha = (b) => createHash('sha256').update(b).digest('hex');
-const roleOf = (n) => (n.endsWith('.apk') ? 'apk' : n.endsWith('.ipa') ? 'ipa' : n === 'fdroid.tar' ? 'fdroid' : null);
+const roleOf = (n) => (n.endsWith('.apk') ? 'apk' : n.endsWith('.ipa') ? 'ipa' : n === 'fdroid-index.tar' ? 'fdroid' : null);
 
 export function makeIncoming({ dir, tag, commit }) {
   const v = fromTag(tag);
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('sourceCommit must be 40 lower-case hex digits');
   const files = readdirSync(dir).filter((n) => n !== 'incoming.json').sort().map((name) => {
     const role = roleOf(name);
-    if (!role) throw new Error(`${name}: not an apk, ipa or fdroid.tar`);
+    if (!role) throw new Error(`${name}: not an apk, ipa or fdroid-index.tar`);
+    tooBig(name, statSync(join(dir, name)).size);
     const b = readFileSync(join(dir, name));
     return { name, role, sha256: sha(b), size: b.length };
   });
@@ -46,6 +50,7 @@ export function verifyIncoming(dir, { certCheck }) {
     const p = join(dir, f.name);
     let st; try { st = lstatSync(p); } catch { throw new Error(`${f.name}: missing`); }
     if (!st.isFile()) throw new Error(`${f.name}: not a regular file`);
+    tooBig(f.name, st.size);
     const b = readFileSync(p);
     if (b.length !== f.size || sha(b) !== f.sha256) throw new Error(`${f.name}: sha256 or size differs from the manifest`);
     if (roleOf(f.name) !== f.role) throw new Error(`${f.name}: role ${f.role} does not fit the name`);
@@ -54,13 +59,13 @@ export function verifyIncoming(dir, { certCheck }) {
   const of = (r) => m.files.filter((f) => f.role === r);
   if (m.app === 'wall') {
     const want = `earthshade-wall-${v.versionName}.apk`;
-    if (of('apk').length !== 1 || of('apk')[0].name !== want || of('ipa').length) throw new Error(`a wall hand-over holds exactly ${want} (and optionally fdroid.tar), no ipa`);
-    if (of('fdroid').length > 1) throw new Error('more than one fdroid.tar');
+    if (of('apk').length !== 1 || of('apk')[0].name !== want || of('ipa').length) throw new Error(`a wall hand-over holds exactly ${want} (and optionally fdroid-index.tar), no ipa`);
+    if (of('fdroid').length > 1) throw new Error('more than one fdroid-index.tar');
     certCheck(join(dir, want));
   } else {
     const re = new RegExp(`^earthshade-${m.app}-${v.versionName.replace(/\./g, '\\.')}-build\\d+\\.ipa$`);
     if (of('ipa').length !== 1 || !re.test(of('ipa')[0].name) || of('apk').length) throw new Error(`an Apple hand-over holds exactly one earthshade-${m.app}-${v.versionName}-build<n>.ipa`);
-    if (of('fdroid').length) throw new Error('fdroid.tar belongs to a wall hand-over only');
+    if (of('fdroid').length) throw new Error('fdroid-index.tar belongs to a wall hand-over only');
   }
   return m;
 }
